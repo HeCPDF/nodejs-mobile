@@ -127,8 +127,17 @@ constexpr int kAppleArmPageSize = 1 << 14;
 
 const int kMmapFdOffset = 0;
 
-#if V8_OS_IOS
+#if V8_OS_IOS && V8_TARGET_ARCH_ARM64
 // --- iOS 26+/TXM JIT support --------------------------------------------
+//
+// Real compile failure on the x64-simulator target (Intel Mac Simulator
+// builds), caught by nodejs-mobile's own CI, not assumed: the trap
+// functions below are raw ARM64 assembly (`mov x16, ...`/`brk #0xf00d`),
+// which naturally doesn't assemble under an x86_64 target. Added the
+// V8_TARGET_ARCH_ARM64 guard for exactly that reason -- TXM/this
+// breakpoint protocol are an Apple Silicon-only concern anyway (no
+// x86_64 iOS device has ever shipped TXM), so x64-simulator builds
+// simply don't need this code at all, not just "can't compile it".
 //
 // iOS denies a third-party process the ability to mark memory executable
 // at runtime (no dynamic-codesigning entitlement available to a
@@ -165,12 +174,15 @@ const int kMmapFdOffset = 0;
 //
 // NOT verified on a real device -- there is no device or TXM-capable
 // environment in this pipeline. Verified: the trap opcodes/protocol
-// against the real reference source above, and that this compiles
-// (guarded entirely behind V8_OS_IOS, so it cannot affect non-iOS
-// builds, and Simulator builds -- which define V8_OS_IOS as inherited
-// from TARGET_OS_IPHONE but are not iOS's real sandbox -- would only
-// reach this code if csops/getppid/opendir report a debugged+TXM state,
-// which they won't in Simulator).
+// against the real reference source above, and (after a real, CI-caught
+// failure on the x64-simulator target -- ARM64 assembly obviously
+// doesn't assemble for x86_64, hence the V8_TARGET_ARCH_ARM64 guard)
+// that this actually compiles on every architecture nodejs-mobile's own
+// CI builds. Guarded entirely behind V8_OS_IOS && V8_TARGET_ARCH_ARM64,
+// so it cannot affect any non-iOS or non-arm64 build; arm64-simulator
+// builds do share this code path (same arch, same V8_OS_IOS) but would
+// only actually reach it if csops/getppid/opendir report a
+// debugged+TXM state, which they won't in Simulator.
 
 extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr,
                       size_t usersize);
@@ -238,7 +250,7 @@ bool ShouldTryJIT26Protocol() {
   return IOSDebuggerAttached() && DebuggerLikelyStillAttached() &&
          DeviceHasTXM();
 }
-#endif  // V8_OS_IOS
+#endif  // V8_OS_IOS && V8_TARGET_ARCH_ARM64
 
 // TODO(v8:10026): Add the right permission flag to make executable pages
 // guarded.
@@ -600,21 +612,22 @@ bool OS::SetPermissions(void* address, size_t size, MemoryPermission access) {
 
   int prot = GetProtectionFromMemoryPermission(access);
 
-#if V8_OS_IOS
+#if V8_OS_IOS && V8_TARGET_ARCH_ARM64
   // Route straight through the debugger-mediated JIT26 breakpoint
   // protocol instead of ever attempting the plain mprotect below, when
   // we're confident it would need it (TXM device, debugger genuinely
   // attached right now, an executable permission actually requested) --
   // see the ShouldTryJIT26Protocol()/JIT26PrepareRegion() block above
   // for the full picture and honest scope (same-address case only).
-  // Every other case (non-iOS, iOS without a debugger, iOS with a
-  // debugger on a non-TXM device where CS_DEBUGGED alone already lets
-  // the plain mprotect below succeed) falls through unchanged.
+  // Every other case (non-iOS, x64-simulator, iOS without a debugger,
+  // iOS with a debugger on a non-TXM device where CS_DEBUGGED alone
+  // already lets the plain mprotect below succeed) falls through
+  // unchanged.
   if ((prot & PROT_EXEC) && ShouldTryJIT26Protocol()) {
     void* prepared = JIT26PrepareRegion(address, size);
     return prepared == address;
   }
-#endif  // V8_OS_IOS
+#endif  // V8_OS_IOS && V8_TARGET_ARCH_ARM64
 
   int ret = mprotect(address, size, prot);
 
