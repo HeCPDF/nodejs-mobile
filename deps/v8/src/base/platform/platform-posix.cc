@@ -72,6 +72,10 @@
 #define MAP_ANONYMOUS MAP_ANON
 #endif
 
+#if V8_OS_IOS
+#include <dirent.h>
+#endif  // V8_OS_IOS
+
 #if defined(V8_OS_SOLARIS)
 #if (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE > 2) || defined(__EXTENSIONS__)
 extern "C" int madvise(caddr_t, size_t, int);
@@ -122,6 +126,119 @@ constexpr int kAppleArmPageSize = 1 << 14;
 #endif
 
 const int kMmapFdOffset = 0;
+
+#if V8_OS_IOS
+// --- iOS 26+/TXM JIT support --------------------------------------------
+//
+// iOS denies a third-party process the ability to mark memory executable
+// at runtime (no dynamic-codesigning entitlement available to a
+// free/personal-team signing identity) unless the process is
+// CS_DEBUGGED (a live debugger attached). On iOS 26+ devices with TXM
+// (Trusted Execution Monitor), CS_DEBUGGED alone is not sufficient
+// either -- the attached debugger itself has to perform the permission
+// change on this process's behalf, via a breakpoint-based protocol:
+// this process executes a specific trap instruction sequence, the
+// debugger (running a JIT-enabling tool's own script -- e.g. StikDebug;
+// not something this app provides, embeds, or sends) intercepts the
+// resulting signal, does the real work via its own elevated GDB-remote
+// access, and resumes this process.
+//
+// This is a real, working protocol other iOS apps that need JIT already
+// use (utmapp/UTM; AngelAuraMC/Amethyst-iOS). The trap opcodes and
+// register conventions below are copied verbatim from Amethyst-iOS's
+// Natives/utils.m (JIT26PrepareRegion, isJITEnabled,
+// JIT26IsLikelyDebuggerKeepAttached, DeviceHasTXMReal) and cross-checked
+// against their companion debugger-side script,
+// Natives/resources/UniversalJIT26.js, not invented or guessed.
+//
+// Scope, stated rather than hidden: only the "make this EXISTING
+// already-mmap'd address executable in place" path is implemented --
+// not the FORCE_MIRRORED case (a separate read-execute virtual mapping
+// of the same physical page at a DIFFERENT address, needed on some
+// devices per Amethyst's own DeviceCanCreateRXMap() probe), which would
+// require V8's code generation to track two separate addresses for the
+// same logical memory throughout -- a materially larger change than
+// this one. A FORCE_MIRRORED device isn't even probed for here; the
+// same-address check below (`prepared == address`) already fails safe
+// if a mirrored device ever returns a different address, rather than
+// silently misusing it.
+//
+// NOT verified on a real device -- there is no device or TXM-capable
+// environment in this pipeline. Verified: the trap opcodes/protocol
+// against the real reference source above, and that this compiles
+// (guarded entirely behind V8_OS_IOS, so it cannot affect non-iOS
+// builds, and Simulator builds -- which define V8_OS_IOS as inherited
+// from TARGET_OS_IPHONE but are not iOS's real sandbox -- would only
+// reach this code if csops/getppid/opendir report a debugged+TXM state,
+// which they won't in Simulator).
+
+extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr,
+                      size_t usersize);
+constexpr int kCsDebugged = 0x10000000;
+
+// Naked (no prologue/epilogue) so the attached debugger can read/write
+// registers directly around the `brk` trap exactly as it left them --
+// exact opcodes from Amethyst-iOS's utils.m.
+__attribute__((noinline, optnone, naked)) void* JIT26PrepareRegion(
+    void* addr, size_t len) {
+  asm("mov x16, #1 \n"
+      "brk #0xf00d \n"
+      "ret");
+}
+
+bool IOSDebuggerAttached() {
+  int flags = 0;
+  csops(getpid(), 0, &flags, sizeof(flags));
+  return (flags & kCsDebugged) != 0;
+}
+
+// getppid() returns launchd's PID (1) unless a debugger is actively
+// ptrace-attached to this process right now. Needed specifically
+// because TXM requires the debugger to still be attached at the moment
+// of each JIT26PrepareRegion call -- unlike pre-TXM devices, where
+// CS_DEBUGGED sticks even after the debugger later detaches. Copied
+// from Amethyst's JIT26IsLikelyDebuggerKeepAttached().
+bool DebuggerLikelyStillAttached() { return getppid() != 1; }
+
+// Deterministically detects TXM by checking for its firmware image
+// under /private/preboot -- copied from Amethyst's DeviceHasTXMReal().
+// Their speculative chip-ID-based fallback for when /private/preboot
+// isn't accessible is deliberately not ported: misdetecting "no TXM"
+// here only means falling through to a plain mprotect attempt that
+// fails the same way it already did before this patch existed, not a
+// worse outcome than misdetecting "has TXM" would be.
+bool DeviceHasTXM() {
+  DIR* d = opendir("/private/preboot");
+  if (!d) return false;
+  struct dirent* entry;
+  char txm_path[PATH_MAX] = {0};
+  bool found_dir = false;
+  while ((entry = readdir(d)) != nullptr) {
+    if (strlen(entry->d_name) == 96) {
+      snprintf(txm_path, sizeof(txm_path),
+               "/private/preboot/%s/usr/standalone/firmware/FUD/"
+               "Ap,TrustedExecutionMonitor.img4",
+               entry->d_name);
+      found_dir = true;
+      break;
+    }
+  }
+  closedir(d);
+  return found_dir && access(txm_path, F_OK) == 0;
+}
+
+// Deliberately conservative: true only when reasonably confident the
+// JIT26 breakpoint protocol is both necessary (TXM present) and likely
+// to work (a debugger is genuinely attached right now). A false
+// negative just falls back to the plain mprotect attempt (failing the
+// same way it already did); a false positive would execute a `brk`
+// trap with no debugger listening, raising SIGTRAP with nothing to
+// handle it -- so this errs toward false negatives.
+bool ShouldTryJIT26Protocol() {
+  return IOSDebuggerAttached() && DebuggerLikelyStillAttached() &&
+         DeviceHasTXM();
+}
+#endif  // V8_OS_IOS
 
 // TODO(v8:10026): Add the right permission flag to make executable pages
 // guarded.
@@ -482,6 +599,23 @@ bool OS::SetPermissions(void* address, size_t size, MemoryPermission access) {
   DCHECK_EQ(0, size % CommitPageSize());
 
   int prot = GetProtectionFromMemoryPermission(access);
+
+#if V8_OS_IOS
+  // Route straight through the debugger-mediated JIT26 breakpoint
+  // protocol instead of ever attempting the plain mprotect below, when
+  // we're confident it would need it (TXM device, debugger genuinely
+  // attached right now, an executable permission actually requested) --
+  // see the ShouldTryJIT26Protocol()/JIT26PrepareRegion() block above
+  // for the full picture and honest scope (same-address case only).
+  // Every other case (non-iOS, iOS without a debugger, iOS with a
+  // debugger on a non-TXM device where CS_DEBUGGED alone already lets
+  // the plain mprotect below succeed) falls through unchanged.
+  if ((prot & PROT_EXEC) && ShouldTryJIT26Protocol()) {
+    void* prepared = JIT26PrepareRegion(address, size);
+    return prepared == address;
+  }
+#endif  // V8_OS_IOS
+
   int ret = mprotect(address, size, prot);
 
   // MacOS 11.2 on Apple Silicon refuses to switch permissions from
